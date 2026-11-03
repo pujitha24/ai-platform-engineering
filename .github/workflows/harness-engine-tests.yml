@@ -24,7 +24,9 @@ concurrency:
 
 jobs:
   test-harness-engine:
-    runs-on: ubuntu-latest
+    # MongoDB 8 requires a supported host kernel. The default runner's newer
+    # kernel is currently rejected by this image before tests can start.
+    runs-on: ubuntu-22.04
     services:
       mongodb:
         image: mongo:8.0@sha256:b9924c330a8bbc5800fe9c69f04a84e221eca7b28fd049a0354147d9908fa142

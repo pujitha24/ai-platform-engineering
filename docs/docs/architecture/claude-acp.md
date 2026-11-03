@@ -9,9 +9,9 @@ Claude (ACP) is a first-party Agent Builder and chat integration. It uses the
 same conversations, sharing controls, tool timeline, Stop action and reconnect
 flow as other CAIPE agents. The integration is experimental.
 
-For the proposed separation between the trusted worker and a shell-capable
-agent, see [Claude Code in a preprovisioned sandbox](./preprovisioned-acp-sandboxes.md).
-That design reuses this integration and keeps sandbox management separate.
+For the [broader CAIPE metaharness architecture](./metaharness.md) and its
+first PoC, see [Claude Code in a preprovisioned sandbox](./preprovisioned-acp-sandboxes.md).
+The sandbox integration reuses this runtime and keeps environment management separate.
 
 ## Agent author workflow
 

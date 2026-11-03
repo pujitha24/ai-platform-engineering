@@ -96,7 +96,8 @@ const editAgent = {
   updated_at: "2026-04-29T00:00:00Z",
 };
 
-function mockFetch(platformDefaultId: string | null, includeHarnesses: boolean | "claude-acp" = false) {
+function mockFetch(platformDefaultId: string | null, includeHarnesses: boolean | "claude-acp" | "claude-sandbox" = false) {
+  const claude = includeHarnesses === "claude-acp" || includeHarnesses === "claude-sandbox";
   const fetchMock = jest.fn(async (url: RequestInfo | URL, _init?: RequestInit) => {
     void _init;
     const u = typeof url === "string" ? url : url.toString();
@@ -126,8 +127,8 @@ function mockFetch(platformDefaultId: string | null, includeHarnesses: boolean |
         data: {
           catalog_revision: "catalog-1",
           harnesses: includeHarnesses ? [{
-            id: includeHarnesses === "claude-acp" ? "claude_code_acp" : "claude_agent_sdk",
-            display_name: includeHarnesses === "claude-acp" ? "Claude (ACP)" : "Claude Agent SDK",
+            id: claude ? "claude_code_acp" : "claude_agent_sdk",
+            display_name: claude ? "Claude (ACP)" : "Claude Agent SDK",
             adapter_version: "1.0.0",
             contract_version: 1,
             execution_mode: "in_process",
@@ -135,10 +136,14 @@ function mockFetch(platformDefaultId: string | null, includeHarnesses: boolean |
             certification: "experimental",
             profiles: [{
               id: "safe",
-              harness_id: includeHarnesses === "claude-acp" ? "claude_code_acp" : "claude_agent_sdk",
+              harness_id: claude ? "claude_code_acp" : "claude_agent_sdk",
               display_name: "Safe",
               description: "",
               available: true,
+              ...(includeHarnesses === "claude-sandbox" && { sandbox: {
+                instance_id: "sandbox-1", display_name: "Private sandbox", portal_url: "https://sandbox.example.test/environments/1",
+                policy_revision: "approved-1", policy_summary: "Private files and operator network policy", status: "configured",
+              } }),
             }],
             options_schema: {
               type: "object",
@@ -146,8 +151,8 @@ function mockFetch(platformDefaultId: string | null, includeHarnesses: boolean |
                 max_turns: { type: "integer", title: "Maximum turns", default: 20 },
               },
             },
-            ui_schema: {},
-            capabilities: includeHarnesses === "claude-acp" ? { "tools.broker": { level: "emulated", constraints: { approval_policy: ["never"] } } } : {},
+            ui_schema: includeHarnesses === "claude-sandbox" ? { sandbox_portal_url: "https://sandbox.example.test" } : {},
+            capabilities: claude ? { "tools.broker": { level: "emulated", constraints: { approval_policy: ["never"] } } } : {},
           }] : [],
         },
       });
@@ -343,4 +348,21 @@ it("prepares a Claude ACP blueprint with its profile and caller-authorized tool 
   const payload = JSON.parse(String(call?.[1]?.body));
   expect(payload.blueprint).toMatchObject({ harness: { id: "claude_code_acp", profile_id: "safe" },
     model: { policy: "harness_default" }, tools: { approval_policy: "never" }, thread: { persistence: "durable" } });
+});
+
+it("guides sandbox creation and refreshes only the authenticated connection catalog", async () => {
+  const fetchMock = mockFetch(null, "claude-sandbox");
+  render(<DynamicAgentEditor agent={editAgent} onCancel={jest.fn()} onSave={jest.fn()} />);
+  await flushAsync();
+  fireEvent.click(screen.getByText("Set up a Claude Code sandbox"));
+  expect(screen.getByRole("link", { name: "Open the sandbox application" })).toHaveAttribute("href", "https://sandbox.example.test/");
+  fireEvent.click(screen.getByRole("button", { name: "Refresh sandbox connections" }));
+  await flushAsync();
+  expect(screen.getByRole("status")).toHaveTextContent("Connections refreshed");
+  const last = fetchMock.mock.calls.at(-1);
+  expect(last).toEqual(["/api/harness-engine/harnesses", { cache: "no-store" }]);
+  fireEvent.change(screen.getByLabelText("Execution harness"), { target: { value: "claude_code_acp" } });
+  expect(screen.getByRole("region", { name: "Sandbox connection" })).toHaveTextContent("Private sandbox");
+  expect(screen.getByRole("link", { name: /Manage sandbox/ })).toHaveAttribute("href", "https://sandbox.example.test/environments/1");
+  expect(fetchMock.mock.calls.some(([, init]) => init?.method === "POST")).toBe(false);
 });

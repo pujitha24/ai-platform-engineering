@@ -21,13 +21,16 @@ from websockets.exceptions import ConnectionClosed
 from harness_engine.adapters.base import ExecutionRejectedError, ExecutionUnconfirmedError
 from harness_engine.adapters.claude_acp import ACPEventClient, ClaudeACPAdapter
 from harness_engine.adapters.claude_remote import RemoteClaudeSDKAdapter
+from harness_engine.adapters.claude_sdk import ClaudeSDKAdapter
+from harness_engine.brokers import DefaultPromptCompiler
 from harness_engine.claude_acp_tools import ClaudeACPToolBridge
 from harness_engine.claude_sandbox import MAX_BODY, SandboxTransport, managed_sandbox_process
 from harness_engine.claude_tools import ClaudeToolBroker
 from harness_engine.claude_worker import create_worker_app
 from harness_engine.config import SandboxConnection, Settings
+from harness_engine.coordinator import RunCoordinator
 from harness_engine.main import create_app
-from harness_engine.models import AgentBlueprint, CanonicalEventDraft, RunRecord
+from harness_engine.models import AgentBlueprint, CanonicalEventDraft, RunRecord, RunStatus
 from harness_engine.registry import HarnessRegistry
 from harness_engine.repository import InMemoryRunRepository
 from harness_engine.sessions import AgentSessionNotRunnableError, CAIPEAgentSessionManager
@@ -140,6 +143,13 @@ async def test_retained_target_rejects_profile_repoint_and_other_owner_before_di
     assert binding.execution_target and binding.sandbox.instance_id == "sandbox-example"
     adapter._profiles["primary"].token = SecretStr("rotated-worker-service-token")
     assert (await sessions.resolve("test-user", draft.id, "conversation-example"))[0].binding_id == binding.binding_id
+    adapter._profiles["primary"].sandbox.display_name = "Updated environment label"
+    adapter._profiles["primary"].sandbox.portal_url = "https://portal.example.test/new-management-location"
+    adapter._profiles["primary"].sandbox.policy_summary = "Updated explanatory text"
+    retained, _ = await sessions.resolve("test-user", draft.id, "conversation-example")
+    assert retained.binding_id == binding.binding_id
+    assert retained.execution_target == binding.execution_target
+    assert retained.sandbox.portal_url == "https://portal.example.test/sandboxes/example"
     with pytest.raises(AgentSessionNotRunnableError):
         await sessions.resolve("other-user", draft.id, "conversation-other")
     adapter._profiles["primary"].sandbox.instance_id = "replacement-sandbox"
@@ -330,7 +340,7 @@ async def test_ordinary_remote_profiles_preserve_older_strict_worker_context(set
             result = {"protocolVersion": 1, "agentCapabilities": {}, "_meta": {"caipe.io/harness": {"runtime": "sdk", "durableReplay": True}}}
         elif rpc["method"] == "session/new":
             binding = rpc["params"]["_meta"]["caipe.io/harness"]["context"]["binding"]
-            assert "sandbox" not in binding and "execution_target" not in binding
+            assert {"sandbox", "execution_target", "worker_execution_target"}.isdisjoint(binding)
             result = {"sessionId": ctx.binding.binding_id}
         else:
             assert rpc["method"] == "session/prompt"
@@ -340,6 +350,29 @@ async def test_ordinary_remote_profiles_preserve_older_strict_worker_context(set
     result = [event async for event in RemoteClaudeSDKAdapter(configured, httpx.MockTransport(respond)).execute(ctx)]
     assert result[-1].status == "completed"
     assert calls == ["initialize", "session/new", "session/prompt"]
+
+
+async def test_old_ordinary_worker_admission_replays_after_optional_binding_fields_are_added(settings: Settings) -> None:
+    ctx = context()
+    ctx.blueprint.tools.bindings = []
+    old_fingerprint = hashlib.sha256(ctx.model_dump_json(exclude={
+        "binding": {"execution_target", "worker_execution_target", "sandbox"},
+    }).encode()).hexdigest()
+    repository = InMemoryRunRepository()
+    await repository.create_session(ctx.binding)
+    original = RunRecord(
+        run_id=ctx.turn.run_id, owner_subject=ctx.binding.owner_subject, agent_id=ctx.binding.agent_id,
+        agent_version=ctx.binding.agent_version, conversation_id=ctx.binding.conversation_id,
+        binding_id=ctx.binding.binding_id, harness_id=ctx.binding.harness_id, profile_id=ctx.binding.profile_id,
+        request_fingerprint=old_fingerprint, client_request_id=ctx.turn.run_id, status=RunStatus.COMPLETED,
+    )
+    await repository.admit_run(original)
+    await repository.release_run(ctx.binding.binding_id, original.run_id)
+    registry = HarnessRegistry([ClaudeSDKAdapter(settings)])
+    coordinator = RunCoordinator(repository, registry, CAIPEAgentSessionManager(repository, registry, b"test-key"), DefaultPromptCompiler())
+    replay = await coordinator.start_context(ctx)
+    assert replay.run_id == original.run_id
+    assert coordinator._tasks == {}
 
 
 async def test_sandbox_profiles_reject_older_worker_before_session_admission(settings: Settings, tmp_path: Path) -> None:
@@ -445,6 +478,67 @@ async def test_worker_rejects_changed_parent_sandbox_before_process_admission(se
             result = await client.post("/acp", headers={**auth_headers(), "ACP-Protocol-Version": "1"}, json={"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {"cwd": "/workspace", "mcpServers": [], "_meta": {"caipe.io/harness": {"context": ctx.model_dump(mode="json")}}}})
             assert result.status_code == 409
             assert await repository.get_run(ctx.turn.run_id) is None
+
+
+@pytest.mark.parametrize("change,allowed", [
+    ("cosmetic", True), ("credential", True), ("relay_alias", False),
+    ("model", False), ("native_tools", False),
+])
+async def test_worker_pins_private_relay_target_but_allows_cosmetic_and_credential_rotation(
+    settings: Settings, tmp_path: Path, change: str, allowed: bool,
+) -> None:
+    remote = connection("wss://portal.example.test/api/acp/connections/primary/stdio", tmp_path)
+    profiles = {"safe": {"model": "claude-example", "sandbox": {
+        **remote.model_dump(mode="json", exclude={"token"}), "token": remote.token.get_secret_value(),
+    }}}
+    configured = settings.model_copy(update={"claude_sdk_profiles_json": json.dumps(profiles)})
+    repository = InMemoryRunRepository()
+    ctx = context()
+    ctx.blueprint.tools.bindings = []
+    ctx.binding.sandbox = remote.public()
+    metadata = {"caipe.io/harness": {"context": ctx.model_dump(mode="json")}}
+    setup = {"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {"cwd": "/workspace", "mcpServers": [], "_meta": metadata}}
+    worker = create_worker_app(settings=configured, repository=repository)
+    headers = {**auth_headers(), "ACP-Protocol-Version": "1"}
+    async with worker.router.lifespan_context(worker):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=worker), base_url="https://worker.example.test") as client:
+            assert (await client.post("/acp", headers=headers, json=setup)).status_code == 200
+    original = await repository.get_session(ctx.binding.binding_id)
+    assert original.worker_execution_target
+
+    if change == "cosmetic":
+        profiles["safe"]["sandbox"].update({"display_name": "New label", "portal_url": "https://portal.example.test/new-page", "policy_summary": "Updated description"})
+    elif change == "credential":
+        profiles["safe"]["sandbox"]["token"] = "new-rotated-service-token-long-enough"
+    elif change == "relay_alias":
+        profiles["safe"]["sandbox"]["url"] = "wss://portal.example.test/api/acp/connections/replacement/stdio"
+    elif change == "model":
+        profiles["safe"]["model"] = "different-model"
+    changed = configured.model_copy(update={
+        "claude_sdk_profiles_json": json.dumps(profiles),
+        **({"claude_acp_tools": ["Read", "Bash"]} if change == "native_tools" else {}),
+    })
+    calls = []
+
+    class RecordingAdapter(ClaudeACPAdapter):
+        async def stream(self, admitted: Any) -> AsyncIterator[CanonicalEventDraft]:
+            calls.append(admitted)
+            yield CanonicalEventDraft(event_type="content.delta", data={"text": "accepted"})
+
+    replacement = create_worker_app(settings=changed, repository=repository, adapter=RecordingAdapter(changed))
+    setup["method"] = "session/resume"
+    setup["params"]["sessionId"] = ctx.binding.binding_id
+    prompt = {"jsonrpc": "2.0", "id": ctx.turn.run_id, "method": "session/prompt", "params": {
+        "sessionId": ctx.binding.binding_id, "prompt": [{"type": "text", "text": ctx.turn.message}], "_meta": metadata,
+    }}
+    async with replacement.router.lifespan_context(replacement):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=replacement), base_url="https://worker.example.test") as client:
+            resumed = await client.post("/acp", headers=headers, json=setup)
+            result = await client.post("/acp", headers=headers, json=prompt)
+            assert resumed.status_code == (200 if allowed else 409)
+            assert result.status_code == (200 if allowed else 409)
+    assert len(calls) == (1 if allowed else 0)
+    assert (await repository.get_session(ctx.binding.binding_id)).worker_execution_target == original.worker_execution_target
 
 
 async def test_lost_sandbox_transport_retains_worker_reservation_and_does_not_redispatch(settings: Settings, tmp_path: Path) -> None:

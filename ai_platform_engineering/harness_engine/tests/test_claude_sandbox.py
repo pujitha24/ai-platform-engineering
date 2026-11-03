@@ -14,6 +14,7 @@ from typing import Any
 
 import httpx2 as httpx
 import pytest
+from acp import connect_to_agent
 from pydantic import SecretStr, ValidationError
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
@@ -651,6 +652,111 @@ async def test_full_receive_queue_still_exposes_eof_after_remote_exit() -> None:
     await transport.pump()
     assert [message["id"] for message in [await transport.receive() for _ in range(64)]] == list(range(64))
     assert await asyncio.wait_for(transport.receive(), 0.1) is None
+
+
+async def test_shutdown_wakes_full_queue_and_reads_confirmed_drain() -> None:
+    class Peer:
+        def __init__(self) -> None:
+            self.frames: asyncio.Queue[str] = asyncio.Queue()
+            self.cancel_sent = asyncio.Event()
+
+        def __aiter__(self) -> Peer:
+            return self
+
+        async def __anext__(self) -> str:
+            return await self.frames.get()
+
+        async def send(self, raw: str) -> None:
+            assert json.loads(raw) == {"type": "cancel"}
+            self.cancel_sent.set()
+            await self.frames.put(json.dumps({
+                "type": "exit", "run_id": "run-example", "process_id": "process-example",
+                "returncode": 0, "drained": True,
+            }))
+
+    peer = Peer()
+    transport = SandboxTransport(peer, context(), {"process_id": "process-example"}, None)
+    for index in range(64):
+        transport.inbox.put_nowait({"jsonrpc": "2.0", "id": index, "result": {}})
+    message = json.dumps({"jsonrpc": "2.0", "id": 64, "result": {}}).encode() + b"\n"
+    await peer.frames.put(json.dumps({"type": "stdout", "data": base64.b64encode(message).decode()}))
+    pump = asyncio.create_task(transport.pump())
+    await asyncio.sleep(0)  # Let the pump block on the full inbox.
+    assert not transport.exited.is_set()
+    await transport.close()
+    await asyncio.wait_for(transport.settle(), 1)
+    await asyncio.wait_for(pump, 1)
+    assert peer.cancel_sent.is_set()
+    assert transport.drained
+    assert [message["id"] for message in [await transport.receive() for _ in range(64)]] == list(range(64))
+    assert await transport.receive() is None
+
+
+async def test_acp_close_discards_late_stdout_until_confirmed_drain() -> None:
+    class Peer:
+        def __init__(self) -> None:
+            self.cancel_sent = asyncio.Event()
+            message = json.dumps({"jsonrpc": "2.0", "method": "example/update", "params": {}}).encode() + b"\n"
+            self.frames = iter([
+                json.dumps({"type": "stdout", "data": base64.b64encode(message).decode()})
+                for _ in range(65)
+            ] + [json.dumps({
+                "type": "exit", "run_id": "run-example", "process_id": "process-example",
+                "returncode": 0, "drained": True,
+            })])
+
+        def __aiter__(self) -> Peer:
+            return self
+
+        async def __anext__(self) -> str:
+            await self.cancel_sent.wait()
+            try:
+                return next(self.frames)
+            except StopIteration:
+                raise StopAsyncIteration from None
+
+        async def send(self, raw: str) -> None:
+            assert json.loads(raw) == {"type": "cancel"}
+            self.cancel_sent.set()
+
+    peer = Peer()
+    transport = SandboxTransport(peer, context(), {"process_id": "process-example"}, None)
+    pump = asyncio.create_task(transport.pump())
+    connection = connect_to_agent(ACPEventClient(), transport)
+    await connection.close()
+    await asyncio.wait_for(transport.settle(), 1)
+    await asyncio.wait_for(pump, 1)
+    assert transport.drained
+    assert transport.inbox.empty() or await transport.receive() is None
+
+
+async def test_normal_stream_retains_order_under_backpressure() -> None:
+    class Peer:
+        def __init__(self) -> None:
+            self.frames: asyncio.Queue[str] = asyncio.Queue()
+
+        def __aiter__(self) -> Peer:
+            return self
+
+        async def __anext__(self) -> str:
+            return await self.frames.get()
+
+    peer = Peer()
+    transport = SandboxTransport(peer, context(), {"process_id": "process-example"}, None)
+    for index in range(70):
+        message = json.dumps({"jsonrpc": "2.0", "id": index, "result": {}}).encode() + b"\n"
+        await peer.frames.put(json.dumps({"type": "stdout", "data": base64.b64encode(message).decode()}))
+    await peer.frames.put(json.dumps({
+        "type": "exit", "run_id": "run-example", "process_id": "process-example",
+        "returncode": 0, "drained": True,
+    }))
+    pump = asyncio.create_task(transport.pump())
+    await asyncio.sleep(0)
+    assert transport.inbox.full()
+    received = [await asyncio.wait_for(transport.receive(), 1) for _ in range(70)]
+    await asyncio.wait_for(pump, 1)
+    assert [message["id"] for message in received] == list(range(70))
+    assert transport.drained
 
 
 async def test_sandbox_tool_frames_cannot_target_other_credentials_or_dispatch_after_stop() -> None:

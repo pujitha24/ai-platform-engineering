@@ -82,6 +82,7 @@ class SandboxTransport:
         self.bridge = bridge
         self.inbox: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=64)
         self.exited = asyncio.Event()
+        self.closing = asyncio.Event()
         self.drained = False
         self.cancelled = False
         self.error: BaseException | None = None
@@ -111,7 +112,29 @@ class SandboxTransport:
     async def close(self) -> None:
         if not self.cancelled and not self.drained:
             self.cancelled = True
+            # ACP closes its receiver immediately after this callback. Wake a
+            # pump blocked on a full inbox so it can still read the drain receipt.
+            self.closing.set()
             await self.frame({"type": "cancel"})
+
+    async def enqueue(self, message: dict[str, Any]) -> None:
+        """Preserve ordered delivery until the ACP receiver is closed."""
+        if self.cancelled:
+            return
+        try:
+            self.inbox.put_nowait(message)
+            return
+        except asyncio.QueueFull:
+            pass
+        put = asyncio.create_task(self.inbox.put(message))
+        closing = asyncio.create_task(self.closing.wait())
+        try:
+            await asyncio.wait({put, closing}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in (put, closing):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(put, closing, return_exceptions=True)
 
     async def tool_request(self, frame: dict[str, Any]) -> None:
         request_id = frame.get("id")
@@ -176,7 +199,11 @@ class SandboxTransport:
                     raise ValueError("Invalid sandbox transport frame")
                 kind = frame.get("type")
                 if kind == "stdout":
-                    self.buffer.extend(decode_bytes(frame.get("data")))
+                    chunk = decode_bytes(frame.get("data"))
+                    if self.cancelled:
+                        self.buffer.clear()
+                        continue
+                    self.buffer.extend(chunk)
                     if len(self.buffer) > MAX_BODY:
                         raise ValueError("Sandbox ACP line exceeds its bound")
                     while b"\n" in self.buffer:
@@ -186,7 +213,10 @@ class SandboxTransport:
                             message = json.loads(line)
                             if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
                                 raise ValueError("Invalid sandbox ACP message")
-                            await self.inbox.put(message)
+                            await self.enqueue(message)
+                            if self.cancelled:
+                                self.buffer.clear()
+                                break
                 elif kind == "stderr":
                     # Provider stderr may contain sensitive tool/model output.
                     decode_bytes(frame.get("data"))

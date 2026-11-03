@@ -7,6 +7,7 @@ import base64
 import binascii
 import hashlib
 import json
+import ssl
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -252,6 +253,18 @@ class SandboxTransport:
             raise ExecutionUnconfirmedError("Sandbox process did not confirm drain; retain the session reservation")
 
 
+def sandbox_tls_context(profile: SandboxConnection) -> ssl.SSLContext | None:
+    if urlsplit(profile.url).scheme != "wss":
+        return None
+    # Keep hostname and server certificate verification enabled. The optional
+    # client identity remains on this trusted worker and is loaded afresh for
+    # every connection, allowing a mounted secret to rotate.
+    tls = ssl.create_default_context()
+    if profile.client_cert_file:
+        tls.load_cert_chain(profile.client_cert_file, profile.client_key_file)
+    return tls
+
+
 @asynccontextmanager
 async def managed_sandbox_process(
     client: object,
@@ -274,7 +287,7 @@ async def managed_sandbox_process(
         profile.url, additional_headers={
             "Authorization": f"Bearer {profile.token.get_secret_value()}",
             "X-Harness-Engine-Subject": profile.owner_subject,
-        }, max_size=MAX_FRAME, max_queue=16, open_timeout=10, close_timeout=2,
+        }, ssl=sandbox_tls_context(profile), max_size=MAX_FRAME, max_queue=16, open_timeout=10, close_timeout=2,
     ) as websocket:
         try:
             await websocket.send(json.dumps({"type": "open", "protocol": 1, **identity}))

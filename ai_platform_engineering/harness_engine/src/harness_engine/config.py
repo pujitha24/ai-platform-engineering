@@ -115,10 +115,19 @@ class SandboxConnection(SandboxPolicy):
 
     url: str = Field(..., min_length=1, max_length=2048)
     token: SecretStr = Field(..., min_length=32)
+    client_cert_file: str | None = Field(default=None, min_length=1, max_length=1024)
+    client_key_file: str | None = Field(default=None, min_length=1, max_length=1024)
 
     @model_validator(mode="after")
     def validate_transport(self) -> SandboxConnection:
         validate_web_url(self.url, websocket=True)
+        if (self.client_cert_file is None) != (self.client_key_file is None):
+            raise ValueError("Sandbox client certificate and key must be configured together")
+        if self.client_cert_file is not None and urlsplit(self.url).scheme != "wss":
+            raise ValueError("Sandbox client certificates require WSS")
+        for path in (self.client_cert_file, self.client_key_file):
+            if path is not None and (not PurePosixPath(path).is_absolute() or ".." in PurePosixPath(path).parts or "\x00" in path):
+                raise ValueError("Sandbox client certificate paths must be absolute")
         return self
 
 

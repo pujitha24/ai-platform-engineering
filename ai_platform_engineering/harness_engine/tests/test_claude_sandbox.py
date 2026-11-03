@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import signal
+import ssl
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
@@ -25,7 +26,7 @@ from harness_engine.adapters.claude_remote import RemoteClaudeSDKAdapter
 from harness_engine.adapters.claude_sdk import ClaudeSDKAdapter
 from harness_engine.brokers import DefaultPromptCompiler
 from harness_engine.claude_acp_tools import ClaudeACPToolBridge
-from harness_engine.claude_sandbox import MAX_BODY, SandboxTransport, managed_sandbox_process
+from harness_engine.claude_sandbox import MAX_BODY, SandboxTransport, managed_sandbox_process, sandbox_tls_context
 from harness_engine.claude_tools import ClaudeToolBroker
 from harness_engine.claude_worker import create_worker_app
 from harness_engine.config import SandboxConnection, Settings
@@ -50,6 +51,25 @@ def policy(root: Path) -> dict[str, Any]:
 
 def connection(url: str, root: Path) -> SandboxConnection:
     return SandboxConnection(**policy(root), url=url, token="test-sandbox-service-token-long-enough")
+
+
+def test_sandbox_client_certificate_configuration_is_fail_closed(tmp_path: Path) -> None:
+    base = connection("wss://relay.example.test/api/acp/connections/example/stdio", tmp_path).model_dump()
+    for changes in (
+        {"client_cert_file": "/tmp/client.crt"},
+        {"client_key_file": "/tmp/client.key"},
+        {"client_cert_file": "relative.crt", "client_key_file": "/tmp/client.key"},
+        {"url": "ws://localhost:1234", "client_cert_file": "/tmp/client.crt", "client_key_file": "/tmp/client.key"},
+    ):
+        with pytest.raises(ValidationError):
+            SandboxConnection(**(base | changes))
+    tls = sandbox_tls_context(SandboxConnection(**base))
+    assert tls is not None and tls.check_hostname and tls.verify_mode == ssl.CERT_REQUIRED
+    configured = SandboxConnection(**(base | {
+        "client_cert_file": str(tmp_path / "missing.crt"), "client_key_file": str(tmp_path / "missing.key"),
+    }))
+    with pytest.raises(FileNotFoundError):
+        sandbox_tls_context(configured)
 
 
 def configured_parent(settings: Settings, root: Path, **changes: Any) -> Settings:

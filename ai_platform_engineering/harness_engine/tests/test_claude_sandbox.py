@@ -266,6 +266,68 @@ async def test_explicit_authenticated_prelaunch_rejection_is_actionable(tmp_path
                 pytest.fail("Rejected admission cannot expose a connection")
 
 
+async def test_busy_same_conversation_rejection_preserves_original_work_and_releases_only_rejected_run(
+    settings: Settings, tmp_path: Path,
+) -> None:
+    original_work = {"run_id": "earlier-native-run", "drained": False}
+    initial_work = original_work.copy()
+    opens = []
+    after_rejection = []
+
+    async def handler(websocket: ServerConnection) -> None:
+        opened = json.loads(await websocket.recv())
+        opens.append(opened)
+        await websocket.send(json.dumps({**opened, "type": "error", "code": "sandbox_busy", "admitted": False}))
+        # A known pre-launch denial must not try to cancel the earlier native
+        # producer or send ACP initialization/prompt bytes to it.
+        async for raw in websocket:
+            after_rejection.append(json.loads(raw))
+
+    async with peer(handler) as url:
+        remote = connection(url, tmp_path)
+        worker_settings = settings.model_copy(update={
+            "internal_token": "test-worker-service-token",
+            "claude_sdk_profiles_json": json.dumps({"safe": {"model": "claude-example", "sandbox": {
+                **remote.model_dump(mode="json", exclude={"token"}), "token": remote.token.get_secret_value(),
+            }}}),
+        })
+        worker_repository = InMemoryRunRepository()
+        worker = create_worker_app(settings=worker_settings, repository=worker_repository)
+        parent_settings = configured_parent(settings, tmp_path)
+        parent_repository = InMemoryRunRepository()
+        parent = create_app(settings=parent_settings, repository=parent_repository, adapters=[
+            RemoteClaudeSDKAdapter(parent_settings, httpx.ASGITransport(app=worker), claude_acp=True),
+        ])
+        async with worker.router.lifespan_context(worker), parent.router.lifespan_context(parent):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=parent), base_url="https://engine.example.test", headers=auth_headers()) as client:
+                draft = blueprint(harness_id="claude_code_acp", profile_id="primary")
+                assert (await client.put("/api/v1/agents/agent-example", json={"blueprint": draft})).status_code == 200
+                response = await client.post("/api/v1/runs", json={
+                    "agent_id": "agent-example", "conversation_id": "conversation-example",
+                    "message": "continue", "client_request_id": "request-example",
+                })
+                assert response.status_code == 202
+                run_id = response.json()["data"]["run_id"]
+                for _ in range(100):
+                    run = await parent_repository.get_run(run_id)
+                    binding = await parent_repository.get_session(run.binding_id)
+                    if run.status == RunStatus.FAILED and binding.active_run is None:
+                        break
+                    await asyncio.sleep(0.01)
+                assert run.status == RunStatus.FAILED
+                assert binding.active_run is None
+                events = await parent_repository.list_events(run_id, 0)
+                assert events[-1].data["code"] == "sandbox_busy"
+                assert "another conversation" not in events[-1].data["message"]
+                assert "do not resend automatically" in events[-1].data["message"]
+                worker_run = await worker_repository.get_run(run_id)
+                assert worker_run.status == RunStatus.FAILED
+                assert (await worker_repository.get_session(worker_run.binding_id)).active_run is None
+    assert len(opens) == 1
+    assert after_rejection == []
+    assert original_work == initial_work
+
+
 async def test_real_mcp_request_uses_current_run_capability_and_never_forwards_identity(settings: Settings, tmp_path: Path) -> None:
     calls = []
 

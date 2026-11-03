@@ -30,6 +30,7 @@ MAX_BODY = 512 * 1024
 MCP_HEADERS = {"accept", "content-type", "mcp-session-id", "mcp-protocol-version", "authorization"}
 ADMISSION_MESSAGES = {
     "sandbox_bound": "This sandbox is connected to another conversation. Open its existing chat or create another sandbox.",
+    "sandbox_busy": "Work is still running or needs operator reconciliation. Reopen the original chat or manage the sandbox; do not resend automatically.",
     "sandbox_unavailable": "This sandbox is unavailable. Open its management page, start it, then retry.",
     "identity_mismatch": "Sandbox configuration changed. Reconnect its approved profile before starting a new chat.",
 }
